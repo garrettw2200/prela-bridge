@@ -4,25 +4,24 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"log/slog"
 	"net"
 	"net/http"
+	"net/http/httputil"
+	"net/url"
 	"os"
 	"os/signal"
-	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
 
-	"golang.org/x/sync/errgroup"
 	"tailscale.com/tsnet"
 )
 
 type bridge struct {
 	ts          *tsnet.Server
 	targetAddr  string
-	dialTimeout time.Duration
+	targetURL   *url.URL
 	activeConns atomic.Int64
 	log         *slog.Logger
 }
@@ -37,6 +36,12 @@ func main() {
 	listenPort := envOr("LISTEN_PORT", "8123")
 	healthPort := envOr("HEALTH_PORT", "8124")
 	stateDir := envOr("TS_STATE_DIR", "/tmp/prela-bridge")
+
+	targetURL, err := url.Parse("http://" + targetAddr)
+	if err != nil {
+		log.Error("invalid TARGET_ADDR", "addr", targetAddr, "err", err)
+		os.Exit(1)
+	}
 
 	ts := &tsnet.Server{
 		Hostname:  hostname,
@@ -53,6 +58,7 @@ func main() {
 		"listen", ":"+listenPort,
 		"health", ":"+healthPort,
 		"target", targetAddr,
+		"mode", "http-reverse-proxy",
 	)
 
 	if err := ts.Start(); err != nil {
@@ -64,13 +70,56 @@ func main() {
 	log.Info("tailscale connected")
 
 	b := &bridge{
-		ts:          ts,
-		targetAddr:  targetAddr,
-		dialTimeout: 15 * time.Second,
-		log:         log,
+		ts:         ts,
+		targetAddr: targetAddr,
+		targetURL:  targetURL,
+		log:        log,
 	}
 
-	// Health check server
+	// HTTP reverse proxy using Tailscale dialer
+	tsTransport := &http.Transport{
+		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			return ts.Dial(ctx, "tcp", targetAddr)
+		},
+		MaxIdleConns:          20,
+		IdleConnTimeout:       90 * time.Second,
+		ResponseHeaderTimeout: 300 * time.Second,
+		DisableCompression:    true, // Let ClickHouse handle compression
+	}
+
+	proxy := &httputil.ReverseProxy{
+		Director: func(req *http.Request) {
+			req.URL.Scheme = targetURL.Scheme
+			req.URL.Host = targetURL.Host
+			req.Host = targetURL.Host
+		},
+		Transport: tsTransport,
+		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
+			log.Error("proxy error", "method", r.Method, "path", r.URL.Path, "err", err)
+			http.Error(w, "Bad Gateway", http.StatusBadGateway)
+		},
+	}
+
+	// Main proxy server
+	proxyServer := &http.Server{
+		Addr: ":" + listenPort,
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			active := b.activeConns.Add(1)
+			defer b.activeConns.Add(-1)
+			log.Info("proxying request",
+				"method", r.Method,
+				"path", r.URL.Path,
+				"remote", r.RemoteAddr,
+				"active", active,
+			)
+			proxy.ServeHTTP(w, r)
+		}),
+		ReadTimeout:  300 * time.Second,
+		WriteTimeout: 300 * time.Second,
+		IdleTimeout:  120 * time.Second,
+	}
+
+	// Health check server on separate port
 	healthMux := http.NewServeMux()
 	healthMux.HandleFunc("/healthz", b.healthHandler)
 	healthServer := &http.Server{
@@ -83,132 +132,23 @@ func main() {
 		}
 	}()
 
-	// TCP listener
-	listener, err := net.Listen("tcp", "[::]:"+listenPort)
-	if err != nil {
-		log.Error("listen failed", "err", err)
-		os.Exit(1)
-	}
-
 	// Graceful shutdown
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer stop()
 
-	var wg sync.WaitGroup
-
 	go func() {
 		<-ctx.Done()
-		log.Info("shutting down, draining connections", "active", b.activeConns.Load())
-		listener.Close()
+		log.Info("shutting down", "active", b.activeConns.Load())
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		proxyServer.Shutdown(shutdownCtx)
 		healthServer.Close()
-
-		// Wait for active connections with timeout
-		done := make(chan struct{})
-		go func() { wg.Wait(); close(done) }()
-		select {
-		case <-done:
-			log.Info("all connections drained")
-		case <-time.After(30 * time.Second):
-			log.Warn("drain timeout, forcing shutdown", "remaining", b.activeConns.Load())
-		}
 	}()
 
-	// Accept loop
-	for {
-		conn, err := listener.Accept()
-		if err != nil {
-			if ctx.Err() != nil {
-				break // shutting down
-			}
-			log.Error("accept failed", "err", err)
-			continue
-		}
-
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			b.handleConn(conn)
-		}()
-	}
-}
-
-// closeWriter is implemented by connections that support half-close.
-type closeWriter interface {
-	CloseWrite() error
-}
-
-func (b *bridge) handleConn(clientConn net.Conn) {
-	defer clientConn.Close()
-
-	active := b.activeConns.Add(1)
-	remoteAddr := clientConn.RemoteAddr().String()
-	b.log.Info("connection accepted", "remote", remoteAddr, "active", active)
-
-	defer func() {
-		remaining := b.activeConns.Add(-1)
-		b.log.Info("connection closed", "remote", remoteAddr, "active", remaining)
-	}()
-
-	// TCP keepalive on client side
-	if tc, ok := clientConn.(*net.TCPConn); ok {
-		tc.SetKeepAlive(true)
-		tc.SetKeepAlivePeriod(30 * time.Second)
-	}
-
-	// Dial target through Tailscale with timeout
-	ctx, cancel := context.WithTimeout(context.Background(), b.dialTimeout)
-	defer cancel()
-
-	tsConn, err := b.ts.Dial(ctx, "tcp", b.targetAddr)
-	if err != nil {
-		b.log.Error("dial failed", "target", b.targetAddr, "err", err)
-		return
-	}
-	defer tsConn.Close()
-
-	b.log.Info("tunnel established",
-		"remote", remoteAddr,
-		"target", b.targetAddr,
-		"tsConnType", fmt.Sprintf("%T", tsConn),
-	)
-
-	// TCP keepalive on Tailscale side (if available)
-	if tc, ok := tsConn.(*net.TCPConn); ok {
-		tc.SetKeepAlive(true)
-		tc.SetKeepAlivePeriod(30 * time.Second)
-	}
-
-	// Bidirectional copy with half-close
-	// tsnet.Dial returns a net.Conn that is NOT *net.TCPConn, so we check
-	// for the closeWriter interface to support half-close on any conn type.
-	var g errgroup.Group
-
-	// client -> tailscale
-	g.Go(func() error {
-		buf := make([]byte, 256*1024)
-		n, err := io.CopyBuffer(tsConn, clientConn, buf)
-		b.log.Info("copy client->ts done", "remote", remoteAddr, "bytes", n, "err", err)
-		// Signal write-done to the Tailscale side
-		if cw, ok := tsConn.(closeWriter); ok {
-			cw.CloseWrite()
-		}
-		return err
-	})
-
-	// tailscale -> client
-	g.Go(func() error {
-		buf := make([]byte, 256*1024)
-		n, err := io.CopyBuffer(clientConn, tsConn, buf)
-		b.log.Info("copy ts->client done", "remote", remoteAddr, "bytes", n, "err", err)
-		// Signal write-done to the client side
-		if cw, ok := clientConn.(closeWriter); ok {
-			cw.CloseWrite()
-		}
-		return err
-	})
-
-	if err := g.Wait(); err != nil {
-		b.log.Debug("transfer completed with error", "remote", remoteAddr, "err", err)
+	log.Info("listening", "port", listenPort)
+	if err := proxyServer.ListenAndServe(); err != http.ErrServerClosed {
+		log.Error("server error", "err", err)
+		os.Exit(1)
 	}
 }
 
@@ -246,7 +186,6 @@ func envOr(key, fallback string) string {
 func requireEnv(log *slog.Logger, key string) string {
 	v := os.Getenv(key)
 	if v == "" {
-		// Also check common aliases
 		aliases := map[string]string{
 			"TS_AUTH_KEY": "TS_AUTHKEY",
 		}
