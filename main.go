@@ -94,10 +94,19 @@ func main() {
 			req.Host = targetURL.Host
 		},
 		Transport: tsTransport,
+		ModifyResponse: func(resp *http.Response) error {
+			log.Info("upstream response",
+				"status", resp.StatusCode,
+				"contentLength", resp.ContentLength,
+				"transferEncoding", fmt.Sprintf("%v", resp.TransferEncoding),
+			)
+			return nil
+		},
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
 			log.Error("proxy error", "method", r.Method, "path", r.URL.Path, "err", err)
 			http.Error(w, "Bad Gateway", http.StatusBadGateway)
 		},
+		FlushInterval: -1, // Flush immediately — don't buffer response
 	}
 
 	// Main proxy server
@@ -109,10 +118,19 @@ func main() {
 			log.Info("proxying request",
 				"method", r.Method,
 				"path", r.URL.Path,
+				"query", r.URL.RawQuery,
+				"contentLength", r.ContentLength,
 				"remote", r.RemoteAddr,
 				"active", active,
 			)
+			start := time.Now()
 			proxy.ServeHTTP(w, r)
+			log.Info("request completed",
+				"method", r.Method,
+				"path", r.URL.Path,
+				"duration", time.Since(start).String(),
+				"remote", r.RemoteAddr,
+			)
 		}),
 		ReadTimeout:  300 * time.Second,
 		WriteTimeout: 300 * time.Second,
