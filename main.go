@@ -1,16 +1,18 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
-	"net/http/httputil"
 	"net/url"
 	"os"
 	"os/signal"
+	"strconv"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -25,6 +27,8 @@ type bridge struct {
 	activeConns atomic.Int64
 	log         *slog.Logger
 }
+
+const maxBodySize = 100 * 1024 * 1024 // 100MB
 
 func main() {
 	log := slog.New(slog.NewJSONHandler(os.Stdout, nil))
@@ -58,7 +62,7 @@ func main() {
 		"listen", ":"+listenPort,
 		"health", ":"+healthPort,
 		"target", targetAddr,
-		"mode", "http-reverse-proxy",
+		"mode", "buffer-and-forward",
 	)
 
 	if err := ts.Start(); err != nil {
@@ -76,48 +80,29 @@ func main() {
 		log:        log,
 	}
 
-	// HTTP reverse proxy using Tailscale dialer
+	// Transport using Tailscale dialer.
 	// DisableKeepAlives forces a fresh Tailscale connection per request.
-	// tsnet connections have issues with HTTP keep-alive — the second
-	// request on a reused connection hangs during chunked body transfer.
 	tsTransport := &http.Transport{
 		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
 			log.Info("dialing tailscale", "target", targetAddr)
 			return ts.Dial(ctx, "tcp", targetAddr)
 		},
-		DisableKeepAlives:     true, // Fresh connection per request
+		DisableKeepAlives:     true,
 		ResponseHeaderTimeout: 300 * time.Second,
 		DisableCompression:    true,
 	}
 
-	proxy := &httputil.ReverseProxy{
-		Director: func(req *http.Request) {
-			req.URL.Scheme = targetURL.Scheme
-			req.URL.Host = targetURL.Host
-			req.Host = targetURL.Host
-		},
-		Transport: tsTransport,
-		ModifyResponse: func(resp *http.Response) error {
-			log.Info("upstream response",
-				"status", resp.StatusCode,
-				"contentLength", resp.ContentLength,
-				"transferEncoding", fmt.Sprintf("%v", resp.TransferEncoding),
-			)
-			return nil
-		},
-		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
-			log.Error("proxy error", "method", r.Method, "path", r.URL.Path, "err", err)
-			http.Error(w, "Bad Gateway", http.StatusBadGateway)
-		},
-		FlushInterval: -1, // Flush immediately — don't buffer response
-	}
-
-	// Main proxy server
+	// Main proxy server — buffer-and-forward to avoid gvisor/io.Copy deadlock.
+	// httputil.ReverseProxy streams response bodies via io.Copy, which deadlocks
+	// when the downstream write blocks and gvisor's userspace TCP can't process
+	// upstream ACKs in the same goroutine. Buffering decouples the two sides.
 	proxyServer := &http.Server{
 		Addr: ":" + listenPort,
 		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			active := b.activeConns.Add(1)
 			defer b.activeConns.Add(-1)
+
+			start := time.Now()
 			log.Info("proxying request",
 				"method", r.Method,
 				"path", r.URL.Path,
@@ -126,13 +111,79 @@ func main() {
 				"remote", r.RemoteAddr,
 				"active", active,
 			)
-			start := time.Now()
-			proxy.ServeHTTP(w, r)
+
+			// Build upstream request
+			outReq := r.Clone(r.Context())
+			outReq.URL.Scheme = targetURL.Scheme
+			outReq.URL.Host = targetURL.Host
+			outReq.Host = targetURL.Host
+			outReq.RequestURI = "" // Required for http.Transport
+
+			// Buffer request body before sending through tsnet
+			if r.Body != nil {
+				reqBody, err := io.ReadAll(io.LimitReader(r.Body, maxBodySize))
+				if err != nil {
+					log.Error("request body read error", "err", err)
+					http.Error(w, "Bad Request", http.StatusBadRequest)
+					return
+				}
+				r.Body.Close()
+				outReq.Body = io.NopCloser(bytes.NewReader(reqBody))
+				outReq.ContentLength = int64(len(reqBody))
+			}
+
+			// RoundTrip to upstream via tsnet
+			resp, err := tsTransport.RoundTrip(outReq)
+			if err != nil {
+				log.Error("upstream error",
+					"method", r.Method,
+					"path", r.URL.Path,
+					"err", err,
+					"duration", time.Since(start).String(),
+				)
+				http.Error(w, "Bad Gateway", http.StatusBadGateway)
+				return
+			}
+			defer resp.Body.Close()
+
+			// Buffer the entire response body — decouples tsnet read from downstream write
+			body, err := io.ReadAll(io.LimitReader(resp.Body, maxBodySize))
+			if err != nil {
+				log.Error("upstream body read error",
+					"method", r.Method,
+					"path", r.URL.Path,
+					"err", err,
+					"duration", time.Since(start).String(),
+				)
+				http.Error(w, "Bad Gateway", http.StatusBadGateway)
+				return
+			}
+
+			log.Info("upstream response buffered",
+				"status", resp.StatusCode,
+				"bodySize", len(body),
+				"duration", time.Since(start).String(),
+			)
+
+			// Copy response headers
+			for k, vv := range resp.Header {
+				for _, v := range vv {
+					w.Header().Add(k, v)
+				}
+			}
+			// Replace chunked encoding with explicit Content-Length
+			w.Header().Del("Transfer-Encoding")
+			w.Header().Set("Content-Length", strconv.Itoa(len(body)))
+
+			w.WriteHeader(resp.StatusCode)
+			w.Write(body)
+
 			log.Info("request completed",
 				"method", r.Method,
 				"path", r.URL.Path,
+				"status", resp.StatusCode,
+				"bodySize", len(body),
 				"duration", time.Since(start).String(),
-				"remote", r.RemoteAddr,
 			)
 		}),
 		ReadTimeout:  300 * time.Second,
