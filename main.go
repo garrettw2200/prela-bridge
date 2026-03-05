@@ -132,6 +132,11 @@ func main() {
 	}
 }
 
+// closeWriter is implemented by connections that support half-close.
+type closeWriter interface {
+	CloseWrite() error
+}
+
 func (b *bridge) handleConn(clientConn net.Conn) {
 	defer clientConn.Close()
 
@@ -161,41 +166,48 @@ func (b *bridge) handleConn(clientConn net.Conn) {
 	}
 	defer tsConn.Close()
 
-	// TCP keepalive on Tailscale side
+	b.log.Info("tunnel established",
+		"remote", remoteAddr,
+		"target", b.targetAddr,
+		"tsConnType", fmt.Sprintf("%T", tsConn),
+	)
+
+	// TCP keepalive on Tailscale side (if available)
 	if tc, ok := tsConn.(*net.TCPConn); ok {
 		tc.SetKeepAlive(true)
 		tc.SetKeepAlivePeriod(30 * time.Second)
 	}
 
 	// Bidirectional copy with half-close
+	// tsnet.Dial returns a net.Conn that is NOT *net.TCPConn, so we check
+	// for the closeWriter interface to support half-close on any conn type.
 	var g errgroup.Group
 
 	// client -> tailscale
 	g.Go(func() error {
-		defer func() {
-			if tc, ok := tsConn.(*net.TCPConn); ok {
-				tc.CloseWrite()
-			}
-		}()
 		buf := make([]byte, 256*1024)
-		_, err := io.CopyBuffer(tsConn, clientConn, buf)
+		n, err := io.CopyBuffer(tsConn, clientConn, buf)
+		b.log.Info("copy client->ts done", "remote", remoteAddr, "bytes", n, "err", err)
+		// Signal write-done to the Tailscale side
+		if cw, ok := tsConn.(closeWriter); ok {
+			cw.CloseWrite()
+		}
 		return err
 	})
 
 	// tailscale -> client
 	g.Go(func() error {
-		defer func() {
-			if tc, ok := clientConn.(*net.TCPConn); ok {
-				tc.CloseWrite()
-			}
-		}()
 		buf := make([]byte, 256*1024)
-		_, err := io.CopyBuffer(clientConn, tsConn, buf)
+		n, err := io.CopyBuffer(clientConn, tsConn, buf)
+		b.log.Info("copy ts->client done", "remote", remoteAddr, "bytes", n, "err", err)
+		// Signal write-done to the client side
+		if cw, ok := clientConn.(closeWriter); ok {
+			cw.CloseWrite()
+		}
 		return err
 	})
 
 	if err := g.Wait(); err != nil {
-		// Don't log "use of closed network connection" — it's normal on half-close
 		b.log.Debug("transfer completed with error", "remote", remoteAddr, "err", err)
 	}
 }
