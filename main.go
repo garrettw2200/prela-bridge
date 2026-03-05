@@ -77,14 +77,17 @@ func main() {
 	}
 
 	// HTTP reverse proxy using Tailscale dialer
+	// DisableKeepAlives forces a fresh Tailscale connection per request.
+	// tsnet connections have issues with HTTP keep-alive — the second
+	// request on a reused connection hangs during chunked body transfer.
 	tsTransport := &http.Transport{
 		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			log.Info("dialing tailscale", "target", targetAddr)
 			return ts.Dial(ctx, "tcp", targetAddr)
 		},
-		MaxIdleConns:          20,
-		IdleConnTimeout:       90 * time.Second,
+		DisableKeepAlives:     true, // Fresh connection per request
 		ResponseHeaderTimeout: 300 * time.Second,
-		DisableCompression:    true, // Let ClickHouse handle compression
+		DisableCompression:    true,
 	}
 
 	proxy := &httputil.ReverseProxy{
