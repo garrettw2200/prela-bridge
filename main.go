@@ -177,7 +177,8 @@ func (b *bridge) handleConn(clientConn net.Conn) {
 				tc.CloseWrite()
 			}
 		}()
-		_, err := io.Copy(tsConn, clientConn)
+		buf := make([]byte, 256*1024)
+		_, err := io.CopyBuffer(tsConn, clientConn, buf)
 		return err
 	})
 
@@ -188,7 +189,8 @@ func (b *bridge) handleConn(clientConn net.Conn) {
 				tc.CloseWrite()
 			}
 		}()
-		_, err := io.Copy(clientConn, tsConn)
+		buf := make([]byte, 256*1024)
+		_, err := io.CopyBuffer(clientConn, tsConn, buf)
 		return err
 	})
 
