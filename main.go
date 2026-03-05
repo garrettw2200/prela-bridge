@@ -28,6 +28,19 @@ type bridge struct {
 	log         *slog.Logger
 }
 
+// deadlineConn wraps a net.Conn and refreshes the read deadline before
+// every Read call. This works around gvisor userspace TCP connections
+// (from tsnet.Dial) that stall when a single long-lived deadline is set.
+type deadlineConn struct {
+	net.Conn
+	readTimeout time.Duration
+}
+
+func (c *deadlineConn) Read(p []byte) (int, error) {
+	c.Conn.SetReadDeadline(time.Now().Add(c.readTimeout))
+	return c.Conn.Read(p)
+}
+
 const maxBodySize = 100 * 1024 * 1024 // 100MB
 
 func main() {
@@ -80,15 +93,24 @@ func main() {
 		log:        log,
 	}
 
-	// Transport using Tailscale dialer.
-	// DisableKeepAlives forces a fresh Tailscale connection per request.
+	// Transport using Tailscale dialer with per-read deadline refresh.
+	// NOT using DisableKeepAlives — that sends "Connection: close" which
+	// causes ClickHouse to FIN the connection, and gvisor's userspace TCP
+	// stalls reading buffered data after receiving FIN. Instead, we use
+	// aggressive idle connection cleanup to prevent stale reuse.
 	tsTransport := &http.Transport{
 		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
 			log.Info("dialing tailscale", "target", targetAddr)
-			return ts.Dial(ctx, "tcp", targetAddr)
+			conn, err := ts.Dial(ctx, "tcp", targetAddr)
+			if err != nil {
+				return nil, err
+			}
+			return &deadlineConn{Conn: conn, readTimeout: 30 * time.Second}, nil
 		},
-		DisableKeepAlives:     true,
-		ResponseHeaderTimeout: 300 * time.Second,
+		MaxIdleConns:          1,
+		MaxIdleConnsPerHost:   1,
+		IdleConnTimeout:       5 * time.Second,
+		ResponseHeaderTimeout: 60 * time.Second,
 		DisableCompression:    true,
 	}
 
@@ -158,6 +180,9 @@ func main() {
 				http.Error(w, "Bad Gateway", http.StatusBadGateway)
 				return
 			}
+
+			// Close idle connections to prevent stale gvisor connections from being reused
+			tsTransport.CloseIdleConnections()
 
 			log.Info("upstream response buffered",
 				"status", resp.StatusCode,
