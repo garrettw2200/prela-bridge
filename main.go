@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -26,19 +27,6 @@ type bridge struct {
 	targetURL   *url.URL
 	activeConns atomic.Int64
 	log         *slog.Logger
-}
-
-// deadlineConn wraps a net.Conn and refreshes the read deadline before
-// every Read call. This works around gvisor userspace TCP connections
-// (from tsnet.Dial) that stall when a single long-lived deadline is set.
-type deadlineConn struct {
-	net.Conn
-	readTimeout time.Duration
-}
-
-func (c *deadlineConn) Read(p []byte) (int, error) {
-	c.Conn.SetReadDeadline(time.Now().Add(c.readTimeout))
-	return c.Conn.Read(p)
 }
 
 const maxBodySize = 100 * 1024 * 1024 // 100MB
@@ -75,7 +63,7 @@ func main() {
 		"listen", ":"+listenPort,
 		"health", ":"+healthPort,
 		"target", targetAddr,
-		"mode", "buffer-and-forward",
+		"mode", "raw-conn",
 	)
 
 	if err := ts.Start(); err != nil {
@@ -93,31 +81,11 @@ func main() {
 		log:        log,
 	}
 
-	// Transport using Tailscale dialer with per-read deadline refresh.
-	// NOT using DisableKeepAlives — that sends "Connection: close" which
-	// causes ClickHouse to FIN the connection, and gvisor's userspace TCP
-	// stalls reading buffered data after receiving FIN. Instead, we use
-	// aggressive idle connection cleanup to prevent stale reuse.
-	tsTransport := &http.Transport{
-		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-			log.Info("dialing tailscale", "target", targetAddr)
-			conn, err := ts.Dial(ctx, "tcp", targetAddr)
-			if err != nil {
-				return nil, err
-			}
-			return &deadlineConn{Conn: conn, readTimeout: 30 * time.Second}, nil
-		},
-		MaxIdleConns:          1,
-		MaxIdleConnsPerHost:   1,
-		IdleConnTimeout:       5 * time.Second,
-		ResponseHeaderTimeout: 60 * time.Second,
-		DisableCompression:    true,
-	}
-
-	// Main proxy server — buffer-and-forward to avoid gvisor/io.Copy deadlock.
-	// httputil.ReverseProxy streams response bodies via io.Copy, which deadlocks
-	// when the downstream write blocks and gvisor's userspace TCP can't process
-	// upstream ACKs in the same goroutine. Buffering decouples the two sides.
+	// Main proxy server — raw connection approach.
+	// Bypasses http.Transport entirely to avoid gvisor/chunked-encoding
+	// interactions that cause body reads to stall on larger responses.
+	// Each request: dial tsnet -> write HTTP request -> read HTTP response
+	// -> buffer body -> forward to client.
 	proxyServer := &http.Server{
 		Addr: ":" + listenPort,
 		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -134,64 +102,20 @@ func main() {
 				"active", active,
 			)
 
-			// Build upstream request
-			outReq := r.Clone(r.Context())
-			outReq.URL.Scheme = targetURL.Scheme
-			outReq.URL.Host = targetURL.Host
-			outReq.Host = targetURL.Host
-			outReq.RequestURI = "" // Required for http.Transport
-
-			// Buffer request body before sending through tsnet
-			if r.Body != nil {
-				reqBody, err := io.ReadAll(io.LimitReader(r.Body, maxBodySize))
-				if err != nil {
-					log.Error("request body read error", "err", err)
-					http.Error(w, "Bad Request", http.StatusBadRequest)
-					return
-				}
-				r.Body.Close()
-				outReq.Body = io.NopCloser(bytes.NewReader(reqBody))
-				outReq.ContentLength = int64(len(reqBody))
-			}
-
-			// RoundTrip to upstream via tsnet
-			resp, err := tsTransport.RoundTrip(outReq)
-			if err != nil {
-				log.Error("upstream error",
+			statusCode, headers, body, proxyErr := b.rawProxy(r)
+			if proxyErr != nil {
+				log.Error("proxy error",
 					"method", r.Method,
 					"path", r.URL.Path,
-					"err", err,
+					"err", proxyErr,
 					"duration", time.Since(start).String(),
 				)
 				http.Error(w, "Bad Gateway", http.StatusBadGateway)
 				return
 			}
-			defer resp.Body.Close()
-
-			// Buffer the entire response body — decouples tsnet read from downstream write
-			body, err := io.ReadAll(io.LimitReader(resp.Body, maxBodySize))
-			if err != nil {
-				log.Error("upstream body read error",
-					"method", r.Method,
-					"path", r.URL.Path,
-					"err", err,
-					"duration", time.Since(start).String(),
-				)
-				http.Error(w, "Bad Gateway", http.StatusBadGateway)
-				return
-			}
-
-			// Close idle connections to prevent stale gvisor connections from being reused
-			tsTransport.CloseIdleConnections()
-
-			log.Info("upstream response buffered",
-				"status", resp.StatusCode,
-				"bodySize", len(body),
-				"duration", time.Since(start).String(),
-			)
 
 			// Copy response headers
-			for k, vv := range resp.Header {
+			for k, vv := range headers {
 				for _, v := range vv {
 					w.Header().Add(k, v)
 				}
@@ -200,13 +124,13 @@ func main() {
 			w.Header().Del("Transfer-Encoding")
 			w.Header().Set("Content-Length", strconv.Itoa(len(body)))
 
-			w.WriteHeader(resp.StatusCode)
+			w.WriteHeader(statusCode)
 			w.Write(body)
 
 			log.Info("request completed",
 				"method", r.Method,
 				"path", r.URL.Path,
-				"status", resp.StatusCode,
+				"status", statusCode,
 				"bodySize", len(body),
 				"duration", time.Since(start).String(),
 			)
@@ -246,6 +170,108 @@ func main() {
 	if err := proxyServer.ListenAndServe(); err != http.ErrServerClosed {
 		log.Error("server error", "err", err)
 		os.Exit(1)
+	}
+}
+
+// rawProxy bypasses http.Transport entirely. It dials a fresh tsnet connection,
+// writes the HTTP request manually, reads the response with per-read deadline
+// extensions, and returns the buffered result. This avoids all gvisor/http.Transport
+// interactions that cause body reads to stall on chunked responses.
+func (b *bridge) rawProxy(r *http.Request) (int, http.Header, []byte, error) {
+	ctx, cancel := context.WithTimeout(r.Context(), 120*time.Second)
+	defer cancel()
+
+	// Dial upstream via Tailscale
+	conn, err := b.ts.Dial(ctx, "tcp", b.targetAddr)
+	if err != nil {
+		return 0, nil, nil, fmt.Errorf("dial: %w", err)
+	}
+	defer conn.Close()
+
+	// Build the outbound request
+	outURL := *r.URL
+	outURL.Scheme = b.targetURL.Scheme
+	outURL.Host = b.targetURL.Host
+
+	outReq, err := http.NewRequestWithContext(ctx, r.Method, outURL.String(), nil)
+	if err != nil {
+		return 0, nil, nil, fmt.Errorf("new request: %w", err)
+	}
+
+	// Copy headers from the incoming request
+	for k, vv := range r.Header {
+		for _, v := range vv {
+			outReq.Header.Add(k, v)
+		}
+	}
+	outReq.Header.Set("Host", b.targetURL.Host)
+	// Keep-alive so ClickHouse doesn't FIN before we read the body
+	outReq.Header.Set("Connection", "keep-alive")
+
+	// Buffer and attach request body
+	if r.Body != nil {
+		reqBody, err := io.ReadAll(io.LimitReader(r.Body, maxBodySize))
+		if err != nil {
+			return 0, nil, nil, fmt.Errorf("read request body: %w", err)
+		}
+		r.Body.Close()
+		if len(reqBody) > 0 {
+			outReq.Body = io.NopCloser(bytes.NewReader(reqBody))
+			outReq.ContentLength = int64(len(reqBody))
+		}
+	}
+
+	// Set initial write deadline and write the request to the raw connection
+	conn.SetWriteDeadline(time.Now().Add(30 * time.Second))
+	err = outReq.Write(conn)
+	if err != nil {
+		return 0, nil, nil, fmt.Errorf("write request: %w", err)
+	}
+
+	// Read response with per-read deadline extensions
+	conn.SetReadDeadline(time.Now().Add(60 * time.Second))
+	bufReader := bufio.NewReaderSize(conn, 256*1024) // 256KB buffer
+	resp, err := http.ReadResponse(bufReader, outReq)
+	if err != nil {
+		return 0, nil, nil, fmt.Errorf("read response headers: %w", err)
+	}
+	defer resp.Body.Close()
+
+	// Read the body with periodic deadline extensions.
+	// Each successful read resets the deadline, so we only timeout
+	// if no data arrives for 30 seconds.
+	body, err := readWithDeadlineRefresh(conn, resp.Body, maxBodySize, 30*time.Second)
+	if err != nil {
+		return 0, nil, nil, fmt.Errorf("read body (%d bytes so far): %w", len(body), err)
+	}
+
+	b.log.Info("upstream response buffered",
+		"status", resp.StatusCode,
+		"bodySize", len(body),
+	)
+
+	return resp.StatusCode, resp.Header, body, nil
+}
+
+// readWithDeadlineRefresh reads from r, extending conn's read deadline
+// each time data arrives. This prevents stalls on gvisor connections
+// while allowing large responses to complete as long as data keeps flowing.
+func readWithDeadlineRefresh(conn net.Conn, r io.Reader, maxSize int64, timeout time.Duration) ([]byte, error) {
+	var buf bytes.Buffer
+	tmp := make([]byte, 64*1024) // 64KB read chunks
+	limited := io.LimitReader(r, maxSize)
+	for {
+		conn.SetReadDeadline(time.Now().Add(timeout))
+		n, err := limited.Read(tmp)
+		if n > 0 {
+			buf.Write(tmp[:n])
+		}
+		if err == io.EOF {
+			return buf.Bytes(), nil
+		}
+		if err != nil {
+			return buf.Bytes(), err
+		}
 	}
 }
 
